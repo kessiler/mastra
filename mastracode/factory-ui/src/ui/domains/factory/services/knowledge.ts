@@ -11,44 +11,13 @@ import { requestJson } from './request';
 
 export type KnowledgeRung = 'org' | 'resource' | 'thread';
 
-/** A reconciled structural scope node from the server's scope tree. */
-export interface KnowledgeScopeNode {
-  id: string;
-  name: string;
-  kind?: string;
-  description?: string;
-  parentIds: string[];
-}
-
-export interface KnowledgeScopeTreePayload {
-  roots: Array<{
-    level: KnowledgeRung;
-    id: string;
-    available: boolean;
-  }>;
-  defaultLevel: 'resource';
-  /** Reconciled structural scope tree (omitted when the adapter lacks it). */
-  scopeNodes?: KnowledgeScopeNode[];
-}
-
-/**
- * What the explore view reads: an identity rung (org/resource/thread) or one
- * reconciled structural scope node by id.
- */
-export type KnowledgeSelection =
-  | { scopeLevel: KnowledgeRung; scopeNodeId?: never }
-  | { scopeNodeId: string; scopeLevel?: never };
-
 export interface KnowledgeGraphNode {
   id: string;
   name: string;
   kind: string;
   description?: string;
-  /** Null for structural scope-node members (global, not identity-scoped). */
-  scope: string[] | null;
-  rung: KnowledgeRung | null;
-  /** True for structural scope nodes (member-lens drill targets); absent for content nodes. */
-  isScope?: boolean;
+  scopeIds: string[];
+  rung: KnowledgeRung;
   /** A pinned record's wikilinks reference this node (the pin accent). */
   pinned: boolean;
   /** Knowledge records owned by this node inside the snapshot window (not a total). */
@@ -81,8 +50,23 @@ export interface KnowledgeGraphRecord {
   text: string;
 }
 
+export interface KnowledgeScopeTreeNode {
+  id: string;
+  name: string;
+  kind: string;
+  description?: string;
+  parentScopeIds: string[];
+}
+
+export interface KnowledgeScopeTreePayload {
+  scope: KnowledgeScopeTreeNode;
+  children: KnowledgeScopeTreeNode[];
+  nextCursor?: string;
+}
+
 export interface KnowledgeGraphPayload {
   view: 'project' | 'thread';
+  scopeId: string;
   threadId?: string;
   nodes: KnowledgeGraphNode[];
   edges: KnowledgeGraphEdge[];
@@ -96,12 +80,12 @@ export interface KnowledgeGraphPayload {
 
 export interface KnowledgeNodeRecord {
   id: string;
-  node: string;
+  nodeId: string;
   relation: 'owned' | 'mentions';
   text: string;
-  scope: string[];
+  scopeIds: string[];
   rung: KnowledgeRung;
-  sourceThreadId: string;
+  sourceThreadId?: string;
   capturedAt: string;
   when?: string;
   /** This record IS a pin (authored under the reserved pinned node). */
@@ -112,8 +96,7 @@ export interface KnowledgeNodeRecord {
 export interface KnowledgeActivityEvent {
   id: string;
   action: string;
-  recordType: string;
-  scope: string[];
+  targetType: string;
   createdAt: string;
 }
 
@@ -126,8 +109,8 @@ export interface KnowledgeNodePayload {
     id: string;
     name: string;
     kind: string;
-    content: string;
-    scope: string[];
+    description?: string;
+    scopeIds: string[];
     rung: KnowledgeRung;
     createdAt: string;
     updatedAt: string;
@@ -139,24 +122,25 @@ function knowledgeBase(baseUrl: string, factoryProjectId: string): string {
   return `${baseUrl}/web/factory/projects/${encodeURIComponent(factoryProjectId)}/knowledge`;
 }
 
-// The Knowledge runtime is host-selected; requests carry no key override.
-function knowledgeQuery(threadId: string | undefined, selection?: KnowledgeSelection): string {
-  const query = new URLSearchParams();
-  if (threadId) query.set('threadId', threadId);
-  if (selection?.scopeLevel) query.set('scopeLevel', selection.scopeLevel);
-  if (selection?.scopeNodeId) query.set('scopeNodeId', selection.scopeNodeId);
-  const text = query.toString();
-  return text ? `?${text}` : '';
+function knowledgeQuery(input: { knowledgeKey: string; threadId?: string; scopeId?: string; cursor?: string }): string {
+  const params = new URLSearchParams({ knowledgeKey: input.knowledgeKey });
+  if (input.threadId) params.set('threadId', input.threadId);
+  if (input.scopeId) params.set('scopeId', input.scopeId);
+  if (input.cursor) params.set('cursor', input.cursor);
+  const query = params.toString();
+  return query ? `?${query}` : '';
 }
 
 export async function fetchKnowledgeScopes(
   baseUrl: string,
   factoryProjectId: string,
+  scopeId?: string,
   threadId?: string,
   signal?: AbortSignal,
+  knowledgeKey = 'default',
 ): Promise<KnowledgeScopeTreePayload> {
   return requestJson<KnowledgeScopeTreePayload>(
-    `${knowledgeBase(baseUrl, factoryProjectId)}/scopes${knowledgeQuery(threadId)}`,
+    `${knowledgeBase(baseUrl, factoryProjectId)}/scopes${knowledgeQuery({ knowledgeKey, threadId, scopeId })}`,
     { signal },
   );
 }
@@ -164,12 +148,13 @@ export async function fetchKnowledgeScopes(
 export async function fetchKnowledgeGraph(
   baseUrl: string,
   factoryProjectId: string,
-  selection: KnowledgeSelection,
+  scopeId: string,
   threadId?: string,
   signal?: AbortSignal,
+  knowledgeKey = 'default',
 ): Promise<KnowledgeGraphPayload> {
   return requestJson<KnowledgeGraphPayload>(
-    `${knowledgeBase(baseUrl, factoryProjectId)}/subgraph${knowledgeQuery(threadId, selection)}`,
+    `${knowledgeBase(baseUrl, factoryProjectId)}/subgraph${knowledgeQuery({ knowledgeKey, threadId, scopeId })}`,
     { signal },
   );
 }
@@ -177,12 +162,12 @@ export async function fetchKnowledgeGraph(
 export async function fetchKnowledgeActivity(
   baseUrl: string,
   factoryProjectId: string,
-  scopeLevel: KnowledgeRung,
   threadId?: string,
   signal?: AbortSignal,
+  knowledgeKey = 'default',
 ): Promise<KnowledgeActivityPayload> {
   return requestJson<KnowledgeActivityPayload>(
-    `${knowledgeBase(baseUrl, factoryProjectId)}/activity${knowledgeQuery(threadId, { scopeLevel })}`,
+    `${knowledgeBase(baseUrl, factoryProjectId)}/activity${knowledgeQuery({ knowledgeKey, threadId })}`,
     { signal },
   );
 }
@@ -191,12 +176,13 @@ export async function fetchKnowledgeNode(
   baseUrl: string,
   factoryProjectId: string,
   nodeId: string,
-  selection: KnowledgeSelection,
+  scopeId: string,
   threadId?: string,
   signal?: AbortSignal,
+  knowledgeKey = 'default',
 ): Promise<KnowledgeNodePayload> {
   return requestJson<KnowledgeNodePayload>(
-    `${knowledgeBase(baseUrl, factoryProjectId)}/nodes/${encodeURIComponent(nodeId)}${knowledgeQuery(threadId, selection)}`,
+    `${knowledgeBase(baseUrl, factoryProjectId)}/nodes/${encodeURIComponent(nodeId)}${knowledgeQuery({ knowledgeKey, threadId, scopeId })}`,
     { signal },
   );
 }
