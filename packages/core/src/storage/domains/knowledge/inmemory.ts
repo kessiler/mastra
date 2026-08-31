@@ -495,6 +495,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
 
   async deleteRecordBySource(input: {
     id: string;
+    version: number;
     source: string;
     importRunId?: string;
     expectedAccessEpoch?: number;
@@ -504,6 +505,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
       this.#assertExpectedAccessEpoch(input.expectedAccessEpoch);
       const record = this.#db.knowledgeRecords.get(input.id);
       if (!record || record.source !== input.source) throw new KnowledgeNotFoundError('record', input.id);
+      if (record.version !== input.version) throw new KnowledgeConflictError(input.id);
       const scopeIds = this.#recordScopeIds(record.id);
       const visibilityDetails = this.#db.knowledgeMentions.get(`record:${record.id}`)?.size
         ? undefined
@@ -713,6 +715,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
           if (this.#isRecordVisible(record, scopeIds))
             this.#deleteRecord({
               id: record.id,
+              version: record.version,
               deletedBy: input.record.source,
               importRunId: input.record.importRunId,
             });
@@ -736,6 +739,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
     const parent = this.#db.knowledgeNodes.get(nodeId);
     if (!parent || parent.deletedAt) throw new KnowledgeNotFoundError('node', nodeId);
     const scopeIds = canonicalizeKnowledgeScopeIds(input.scopeIds);
+    if (scopeIds.length === 0) throw new KnowledgeNotFoundError('scope', 'root');
     this.#assertScopeNodes(scopeIds);
     this.#assertScopeNodes(input.resolutionScopeIds ?? scopeIds);
     const now = new Date();
@@ -824,24 +828,34 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
     };
   }
 
-  async deleteRecord(input: { id: string; deletedBy: string; importRunId?: string }): Promise<KnowledgeRecord> {
+  async deleteRecord(input: {
+    id: string;
+    version: number;
+    deletedBy: string;
+    importRunId?: string;
+    expectedAccessEpoch?: number;
+  }): Promise<KnowledgeRecord> {
     this.#assertImportRunExists(input.importRunId);
     return this.#runAtomicMutation(() => this.#deleteRecord(input));
   }
 
   #deleteRecord({
     id,
+    version,
     deletedBy,
     importRunId,
     expectedAccessEpoch,
   }: {
     id: string;
+    version: number;
     deletedBy: string;
     importRunId?: string;
+    expectedAccessEpoch?: number;
   }): KnowledgeRecord {
     this.#assertExpectedAccessEpoch(expectedAccessEpoch);
     const record = this.#db.knowledgeRecords.get(id);
     if (!record) throw new KnowledgeNotFoundError('record', id);
+    if (record.version !== version) throw new KnowledgeConflictError(id);
     if (record.deletedAt) return cloneRecord(record);
     const updated = {
       ...record,
@@ -858,10 +872,12 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
 
   async restoreRecord({
     id,
+    version,
     importRunId,
     expectedAccessEpoch,
   }: {
     id: string;
+    version: number;
     importRunId?: string;
     expectedAccessEpoch?: number;
   }): Promise<KnowledgeRecord> {
@@ -870,6 +886,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
       this.#assertExpectedAccessEpoch(expectedAccessEpoch);
       const record = this.#db.knowledgeRecords.get(id);
       if (!record) throw new KnowledgeNotFoundError('record', id);
+      if (record.version !== version) throw new KnowledgeConflictError(id);
       if (!record.deletedAt) return cloneRecord(record);
       const updated = {
         ...record,
@@ -906,6 +923,7 @@ export class InMemoryKnowledgeStorage extends KnowledgeStorage {
     if (!record) throw new KnowledgeNotFoundError('record', id);
     if (record.version !== version) throw new KnowledgeConflictError(id);
     const canonical = canonicalizeKnowledgeScopeIds(scopeIds);
+    if (canonical.length === 0) throw new KnowledgeNotFoundError('scope', 'root');
     this.#assertScopeNodes(canonical);
     const oldScopeIds = this.#recordScopeIds(record.id);
     const updated = { ...record, version: record.version + 1, updatedAt: new Date() };
