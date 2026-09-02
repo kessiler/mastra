@@ -1197,6 +1197,7 @@ export class KnowledgePG extends KnowledgeStorage {
     sourceId: string;
     targetId: string;
     sourceVersion: number;
+    targetVersion: number;
     importRunId?: string;
     contextScopeId?: string;
     expectedAccessEpoch?: number;
@@ -1208,6 +1209,7 @@ export class KnowledgePG extends KnowledgeStorage {
       if (!source) throw new KnowledgeNotFoundError('node', input.sourceId);
       const target = await this.#getNode(tx, input.targetId);
       if (!target) throw new KnowledgeNotFoundError('node', input.targetId);
+      if (target.version !== input.targetVersion) throw new KnowledgeConflictError(input.targetId);
       const sourceScopeIds = await this.#getNodeScopeIds(tx, source.id);
       const now = new Date();
       const updated = await tx.execute({
