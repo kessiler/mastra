@@ -1948,7 +1948,7 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     approvalScopeIds?: KnowledgeProposalApprovalScopeIds;
   }): Promise<KnowledgeProposal | null> {
     const proposal = await this.getProposal(input.id);
-    return proposal && this.#isProposalVisible(proposal, input) ? proposal : null;
+    return proposal && (await this.#isProposalVisible(this.#client, proposal, input)) ? proposal : null;
   }
 
   async listProposals(input: ListKnowledgeProposalsInput): Promise<ListKnowledgeProposalsOutput> {
@@ -1978,70 +1978,23 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
       );
       args.push(input.cursor, input.cursor, input.cursor);
     }
-    const visibility = this.#proposalVisibilityPredicate(scopeIds, input.approvalScopeIds, args);
-    clauses.push(visibility);
-    args.push(limit + 1);
     const result = await this.#client.execute({
-      sql: `SELECT * FROM "${TABLE_KNOWLEDGE_PROPOSALS}" WHERE ${clauses.join(' AND ')} ORDER BY createdAt DESC,id DESC LIMIT ?`,
+      sql: `SELECT * FROM "${TABLE_KNOWLEDGE_PROPOSALS}"${clauses.length ? ` WHERE ${clauses.join(' AND ')}` : ''} ORDER BY createdAt DESC,id DESC`,
       args,
     });
-    const proposals = result.rows.map(parseProposal);
+    const proposals: KnowledgeProposal[] = [];
+    for (const row of result.rows) {
+      const proposal = parseProposal(row);
+      if (await this.#isProposalVisible(this.#client, proposal, { scopeIds, approvalScopeIds: input.approvalScopeIds }))
+        proposals.push(proposal);
+      if (proposals.length > limit) break;
+    }
     return {
       proposals: proposals.slice(0, limit),
       nextCursor: proposals.length > limit ? proposals[limit - 1]?.id : undefined,
     };
   }
 
-  /**
-   * SQL fragment for the full proposal visibility disjunction:
-   * (proposer-context read AND every target readable) OR direct write
-   * authority over every target. Mutates `args` — call it last before the
-   * LIMIT placeholder so argument order stays aligned.
-   */
-  #proposalVisibilityPredicate(
-    scopeIds: string[],
-    approvalScopeIds: KnowledgeProposalApprovalScopeIds | undefined,
-    args: InValue[],
-  ): string {
-    // An empty readable set disables the read branch (an empty IN () list is
-    // not valid SQL); the readable set binds positionally before the
-    // capability branches and appears twice, so push two copies.
-    let readBranch = 'FALSE';
-    if (scopeIds.length > 0) {
-      const scopePlaceholders = scopeIds.map(() => '?').join(',');
-      args.push(...scopeIds, ...scopeIds);
-      readBranch = `(proposerContextScopeId IN (${scopePlaceholders}) AND NOT EXISTS (
-      SELECT 1 FROM json_each(json_extract(changes, '$.targets')) AS target
-      WHERE NOT EXISTS (
-        SELECT 1 FROM json_each(json_extract(target.value, '$.scopeIds')) AS targetScope
-        WHERE targetScope.value IN (${scopePlaceholders})
-      )
-    ))`;
-    }
-    const capabilityBranches: string[] = [];
-    for (const [capability, authorizedScopeIds] of Object.entries(approvalScopeIds ?? {}) as [
-      KnowledgeProposalApprovalCapability,
-      string[],
-    ][]) {
-      if (!authorizedScopeIds || authorizedScopeIds.length === 0) continue;
-      const authorizedPlaceholders = authorizedScopeIds.map(() => '?').join(',');
-      capabilityBranches.push(
-        `(json_extract(target.value, '$.approvalCapability')=? AND EXISTS (
-          SELECT 1 FROM json_each(json_extract(target.value, '$.scopeIds')) AS targetScope
-          WHERE targetScope.value IN (${authorizedPlaceholders})
-        ))`,
-      );
-      args.push(capability, ...authorizedScopeIds);
-    }
-    const writeBranch =
-      capabilityBranches.length === 0
-        ? '0'
-        : `NOT EXISTS (
-      SELECT 1 FROM json_each(json_extract(changes, '$.targets')) AS target
-      WHERE NOT (${capabilityBranches.join(' OR ')})
-    )`;
-    return `(${readBranch} OR ${writeBranch})`;
-  }
 
   async reviewProposal(input: ReviewKnowledgeProposalInput): Promise<KnowledgeProposal> {
     return this.#transaction(async tx => {
@@ -2161,10 +2114,6 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
   }): Promise<KnowledgeActivityEvent[]> {
     const clauses: string[] = [];
     const args: InValue[] = [];
-    if (input.contextScopeId) {
-      clauses.push('contextScopeId=?');
-      args.push(input.contextScopeId);
-    }
     if (input.importRunId) {
       clauses.push('importRunId=?');
       args.push(input.importRunId);
@@ -2199,6 +2148,8 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     for (const row of result.rows) {
       const action = String(row.action) as KnowledgeActivityAction;
       const details = row.detailsJson == null ? undefined : parseJson<Record<string, unknown>>(row.detailsJson);
+      const proposalId = typeof details?.proposalId === 'string' ? details.proposalId : undefined;
+      if (proposalId && !(await this.getVisibleProposal({ id: proposalId, scopeIds }))) continue;
       const retainedScopeIds = activityVisibilityScopeIds(details);
       const targetType = String(row.targetType) as KnowledgeSemanticDocumentType;
       const visibleDeletion = action === 'delete' && isKnowledgeScopeVisible(retainedScopeIds, scopeIds);
@@ -2651,23 +2602,42 @@ export class KnowledgeLibSQL extends KnowledgeStorage {
     };
   }
 
-  #isProposalVisible(
+  async #isProposalVisible(
+    executor: Executor,
     proposal: KnowledgeProposal,
     input: { scopeIds: KnowledgeScopeIds; approvalScopeIds?: KnowledgeProposalApprovalScopeIds },
-  ): boolean {
+  ): Promise<boolean> {
     const readable = canonicalizeKnowledgeScopeIds(input.scopeIds);
     const proposerContextScopeId = proposal.proposerContextScopeId;
-    if (
+    const readBranch =
       proposerContextScopeId !== undefined &&
-      readable.includes(proposerContextScopeId) &&
-      proposal.targets.every(target => isKnowledgeScopeVisible(target.scopeIds, readable))
-    ) {
-      return true;
-    }
-    return proposal.targets.every(target => {
+      (readable.includes(proposerContextScopeId) ||
+        (await this.#getNodeScopeIds(executor, proposerContextScopeId)).some(scopeId =>
+          readable.includes(scopeId),
+        ));
+    let everyTargetReadable = readBranch;
+    let everyTargetWritable = true;
+    for (const target of proposal.targets) {
+      let currentScopeIds: KnowledgeScopeIds;
+      if (target.type === 'node') {
+        const node = await this.#getNodeIncludingDeleted(executor, target.id);
+        if (!node || node.deletedAt) return false;
+        currentScopeIds = node.isScope ? [node.id] : await this.#getNodeScopeIds(executor, node.id);
+        if (readBranch && !isKnowledgeScopeVisible(currentScopeIds, readable)) everyTargetReadable = false;
+      } else {
+        const record = await this.#getRecord(executor, target.id, true);
+        if (!record || record.deletedAt) return false;
+        currentScopeIds = await this.#getRecordScopeIds(executor, target.id);
+        if (
+          readBranch &&
+          !(await this.#isRecordVisible(executor, record, readable) && isKnowledgeScopeVisible(currentScopeIds, readable))
+        )
+          everyTargetReadable = false;
+      }
       const authorizedScopeIds = input.approvalScopeIds?.[target.approvalCapability];
-      return Boolean(authorizedScopeIds?.some(scopeId => target.scopeIds.includes(scopeId)));
-    });
+      if (!authorizedScopeIds?.some(scopeId => currentScopeIds.includes(scopeId))) everyTargetWritable = false;
+    }
+    return everyTargetReadable || everyTargetWritable;
   }
 
   async #isSemanticOutboxEntryVisible(

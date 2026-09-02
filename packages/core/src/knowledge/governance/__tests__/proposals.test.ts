@@ -273,6 +273,7 @@ describe('Knowledge proposal lifecycle', () => {
         vouchedScopeIds: [ids['principal:owner']!],
       }),
     ).resolves.toMatchObject({ status: 'approved' });
+  });
 
   it('hides conflicted proposals from target-only readers on list and single-id surfaces', async () => {
     const { knowledge, lifecycle, node, ids } = await createFixture();
