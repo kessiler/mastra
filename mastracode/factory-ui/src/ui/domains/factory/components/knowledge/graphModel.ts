@@ -6,7 +6,12 @@
 
 import type { Edge, Node } from '@xyflow/react';
 
-import type { KnowledgeGraphEdge, KnowledgeGraphRecord, KnowledgeGraphNode } from '../../services/knowledge';
+import type {
+  KnowledgeGraphEdge,
+  KnowledgeGraphRecord,
+  KnowledgeGraphNode,
+  KnowledgeRung,
+} from '../../services/knowledge';
 
 export const NODE_SIZE_MIN = 52;
 export const NODE_SIZE_MAX = 176;
@@ -62,11 +67,13 @@ export function degreeMap(edges: KnowledgeGraphEdge[]): Map<string, NodeDegree> 
 }
 
 export interface KnowledgeGraphFilters {
+  /** Scope rungs to show; empty set = show all. */
+  rungs: ReadonlySet<KnowledgeRung>;
   /** Show only pin-accented nodes (and edges between them). */
   pinnedOnly: boolean;
 }
 
-export const NO_FILTERS: KnowledgeGraphFilters = { pinnedOnly: false };
+export const NO_FILTERS: KnowledgeGraphFilters = { rungs: new Set(), pinnedOnly: false };
 
 export function filterGraph(
   nodes: KnowledgeGraphNode[],
