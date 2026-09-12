@@ -2305,7 +2305,9 @@ export class KnowledgePG extends KnowledgeStorage {
     const proposals: KnowledgeProposal[] = [];
     for (const row of result.rows) {
       const proposal = parseProposal(row);
-      if (await this.#isProposalVisible(this.#executor, proposal, { scopeIds, approvalScopeIds: input.approvalScopeIds }))
+      if (
+        await this.#isProposalVisible(this.#executor, proposal, { scopeIds, approvalScopeIds: input.approvalScopeIds })
+      )
         proposals.push(proposal);
       if (proposals.length > limit) break;
     }
@@ -2314,7 +2316,6 @@ export class KnowledgePG extends KnowledgeStorage {
       nextCursor: proposals.length > limit ? proposals[limit - 1]?.id : undefined,
     };
   }
-
 
   async reviewProposal(input: ReviewKnowledgeProposalInput): Promise<KnowledgeProposal> {
     return this.#transaction(async tx => {
@@ -2564,11 +2565,9 @@ export class KnowledgePG extends KnowledgeStorage {
         });
         for (const row of successors.rows) {
           const successor = parseOutbox(row);
+          if (successor.operation === 'delete') continue;
           if (!(await this.#isSemanticOutboxEntryVisible(tx, successor, scopeIds))) continue;
-          const invisiblePredecessorClause =
-            successor.operation === 'delete'
-              ? ''
-              : ` AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(scopeIds) AS scope(value) WHERE scope.value IN (${scopeIds.map(() => '?').join(',')}))`;
+          const invisiblePredecessorClause = ` AND NOT EXISTS (SELECT 1 FROM jsonb_array_elements_text(scopeIds) AS scope(value) WHERE scope.value IN (${scopeIds.map(() => '?').join(',')}))`;
           await tx.execute({
             sql: `UPDATE "${TABLE_KNOWLEDGE_SEMANTIC_OUTBOX}" SET status='completed',completedAt=? WHERE documentId=? AND (status='pending' OR (status='processing' AND claimedAt <= ?)) AND (createdAt < ? OR (createdAt = ? AND id < ?))${invisiblePredecessorClause}`,
             args: [
@@ -2578,7 +2577,7 @@ export class KnowledgePG extends KnowledgeStorage {
               successor.createdAt.toISOString(),
               successor.createdAt.toISOString(),
               successor.id,
-              ...(successor.operation === 'delete' ? [] : scopeIds),
+              ...scopeIds,
             ],
           });
         }
@@ -2994,9 +2993,7 @@ export class KnowledgePG extends KnowledgeStorage {
     const readBranch =
       proposerContextScopeId !== undefined &&
       (readable.includes(proposerContextScopeId) ||
-        (await this.#getNodeScopeIds(executor, proposerContextScopeId)).some(scopeId =>
-          readable.includes(scopeId),
-        ));
+        (await this.#getNodeScopeIds(executor, proposerContextScopeId)).some(scopeId => readable.includes(scopeId)));
     let everyTargetReadable = readBranch;
     let everyTargetWritable = true;
     for (const target of proposal.targets) {
@@ -3012,7 +3009,10 @@ export class KnowledgePG extends KnowledgeStorage {
         currentScopeIds = await this.#getRecordScopeIds(executor, target.id);
         if (
           readBranch &&
-          !(await this.#isRecordVisible(executor, record, readable) && isKnowledgeScopeVisible(currentScopeIds, readable))
+          !(
+            (await this.#isRecordVisible(executor, record, readable)) &&
+            isKnowledgeScopeVisible(currentScopeIds, readable)
+          )
         )
           everyTargetReadable = false;
       }
